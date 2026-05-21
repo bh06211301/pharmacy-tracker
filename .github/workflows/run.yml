@@ -1,0 +1,39 @@
+name: 藥局追蹤器
+
+on:
+  schedule:
+    # 台灣時間週一、三、五早上 08:00（UTC 00:00）
+    - cron: "0 0 * * 1,3,5"
+  workflow_dispatch:   # 也可以手動觸發，方便測試
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 取得程式碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝套件
+        run: pip install gspread google-auth requests
+
+      - name: 寫入 Google 憑證
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > credentials.json
+
+      - name: 執行追蹤
+        env:
+          PLACES_API_KEY: ${{ secrets.PLACES_API_KEY }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          LINE_TOKEN:     ${{ secrets.LINE_TOKEN }}
+          LINE_USER_ID:   ${{ secrets.LINE_USER_ID }}
+        run: python pharmacy_tracker.py
+
+      - name: 清除憑證
+        if: always()
+        run: rm -f credentials.json
