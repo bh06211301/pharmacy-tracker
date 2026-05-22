@@ -3,7 +3,8 @@ pharmacy_tracker.py
 ===================
 藥局異動追蹤系統 — GitHub Actions 版
 覆蓋範圍：台北市、新北市、基隆市、桃園市
-偵測類型：全新開幕 / 疑似搬遷 / 疑似換老闆
+偵測類型：全新開幕 / 疑似搬遷 / 疑似換老闆 / 待確認地址
+排除品牌：杏一、大樹、丁丁、維康、專品、立赫、光點、康是美、屈臣氏、健康人生、富康活力、優嘉、快樂鳥
 執行排程：週一、三、五 08:00（GitHub Actions 自動觸發）
 """
 
@@ -37,7 +38,20 @@ CITY_CODES = {
 }
 
 # ════════════════════════════════════════════
-#  自動產生六角形網格座標（2.5km 間距，無死角）
+#  不拜訪的連鎖品牌（直接排除，不進入比對）
+# ════════════════════════════════════════════
+EXCLUDE_CHAINS = [
+    "杏一", "大樹", "丁丁", "維康", "專品", "立赫", "光點",
+    "康是美", "屈臣氏", "健康人生", "富康活力", "優嘉", "快樂鳥",
+]
+
+def is_excluded_chain(name: str) -> bool:
+    """判斷是否為不拜訪的連鎖品牌"""
+    return any(chain in name for chain in EXCLUDE_CHAINS)
+
+
+# ════════════════════════════════════════════
+#  自動產生六角形網格座標（2.5km 間距）
 # ════════════════════════════════════════════
 
 def generate_grid(city, min_lat, max_lat, min_lon, max_lon, spacing_km=2.5):
@@ -77,7 +91,7 @@ LOCATIONS = build_locations()
 
 
 # ════════════════════════════════════════════
-#  地址正規化
+#  地址正規化與比對
 # ════════════════════════════════════════════
 
 def normalize_address(addr):
@@ -105,26 +119,42 @@ def is_same_location(google_addr, official_addr):
     shorter, longer = (g, o) if len(g) <= len(o) else (o, g)
     return shorter in longer
 
+def is_valid_address(addr: str) -> bool:
+    """過濾英文地址、只有 Taiwan、過短等無法比對的情況"""
+    if not addr or len(addr) < 5:
+        return False
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', addr))
+    return (chinese_chars / len(addr)) >= 0.3
+
 
 # ════════════════════════════════════════════
 #  名稱正規化與比對
 # ════════════════════════════════════════════
 
-def clean_name(name):
-    """移除常見後綴，取出核心名稱"""
+def clean_google_name(name: str) -> str:
+    """清理 Google Maps 藥局名稱的多餘描述"""
+    name = name.split("|")[0].strip()
+    name = re.sub(r"[（(](正常營業中|暫停營業|已永久歇業|休息中|裝修中)[）)]", "", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+def clean_name(name: str) -> str:
+    """移除括號、後綴、品牌前綴，取出核心名稱"""
     name = unicodedata.normalize("NFKC", name)
-    name = re.sub(r"(大?藥局|藥房|藥行|中西藥局|健保藥局|社區藥局"
-                  r"|連鎖藥局|藥師藥局|藥劑生藥局)$", "", name)
-    # 移除連鎖品牌前綴（例：躍獅、杏一、大樹）
-    name = re.sub(r"^(躍獅|杏一|大樹|丁丁|維康|專品|立赫|光點"
-                  r"|康是美|屈臣氏|健康人生|富康活力)", "", name)
+    name = re.sub(r"[（(][^）)]*[）)]", "", name)
+    name = re.sub(
+        r"(大?藥局|藥房|藥行|中西藥局|健保藥局|社區藥局"
+        r"|連鎖藥局|藥師藥局|藥劑生藥局)$", "", name)
+    # 排除名單的品牌前綴一併移除（讓名稱比對更準確）
+    chain_pattern = "|".join(re.escape(c) for c in EXCLUDE_CHAINS)
+    name = re.sub(rf"^({chain_pattern})", "", name)
     return name.strip()
 
-def is_similar_name(google_name, official_name):
-    """判斷兩個名稱是否相似（含簡稱、分店等情況）"""
-    g = clean_name(google_name)
+def is_similar_name(google_name: str, official_name: str) -> bool:
+    """名稱相似判斷：核心名稱至少 3 字才比對"""
+    g = clean_name(clean_google_name(google_name))
     o = clean_name(official_name)
-    if not g or not o or len(g) < 2:
+    if len(g) < 3 or len(o) < 3:
         return False
     return g in o or o in g
 
@@ -156,10 +186,11 @@ def get_or_create_sheet(ss, title, rows=2000, cols=10):
 
 def load_baseline(ss):
     """
-    回傳 list of dict，每筆含：
-      地址、醫事機構名稱
-    只保留四縣市且合約有效的藥局。
-    原始 CSV 欄位：0代碼 1名稱 2種類 3電話 4地址 ... 9終止日 12縣市代碼
+    讀取健保基準資料分頁，只保留四縣市且合約有效的藥局。
+    原始 CSV 欄位：
+      0:代碼 1:名稱 2:種類 3:電話 4:地址
+      5:分區 6:特約 7:服務 8:診療 9:終止日
+      10:看診 11:備註 12:縣市代碼 13:合約起日
     """
     try:
         ws = ss.worksheet("健保基準資料")
@@ -172,11 +203,12 @@ def load_baseline(ss):
     for row in ws.get_all_values()[1:]:
         if len(row) < 13:
             continue
-        if str(row[12]).strip() in TARGET and str(row[9]).strip() >= TODAY_INT:
-            rows.append({
-                "地址": str(row[4]).strip(),
-                "醫事機構名稱": str(row[1]).strip(),
-            })
+        city_code = str(row[12]).strip()
+        term_date = str(row[9]).strip()
+        address   = str(row[4]).strip()
+        name      = str(row[1]).strip()
+        if city_code in TARGET and term_date >= TODAY_INT and address:
+            rows.append({"地址": address, "醫事機構名稱": name})
 
     print(f"📋 健保基準：{len(rows)} 筆有效藥局")
     return rows
@@ -188,9 +220,10 @@ def load_baseline(ss):
 
 def fetch_pharmacies(city, location, radius):
     url, results = "https://maps.googleapis.com/maps/api/place/nearbysearch/json", []
-    params = {"location": location, "radius": radius,
-              "type": "pharmacy", "language": "zh-TW", "key": PLACES_API_KEY}
-
+    params = {
+        "location": location, "radius": radius,
+        "type": "pharmacy", "language": "zh-TW", "key": PLACES_API_KEY,
+    }
     while True:
         try:
             res = requests.get(url, params=params, timeout=10).json()
@@ -226,34 +259,47 @@ def fetch_all():
 
 
 # ════════════════════════════════════════════
-#  核心比對：四種情況
+#  核心比對：四種分類
 # ════════════════════════════════════════════
 
 def classify_pharmacies(all_data, baseline):
     """
-    逐筆比對，分成四類：
-      new_open   🆕 全新開幕：地址不在名單，名稱也沒有
-      relocated  🔄 疑似搬遷：地址不在名單，但有同名在別處
-      new_owner  👤 疑似換老闆：地址相同，但名稱不一樣
-      normal     （略過）：地址和名稱都吻合
+    比對結果分四類：
+      new_open      🆕 全新開幕：地址不在名單，名稱也沒有
+      relocated     🔄 疑似搬遷：地址不在名單，但有同名在別處
+      new_owner     👤 疑似換老闆：地址相同，但名稱不一樣
+      unverifiable  ❓ 待確認：英文地址或無法比對
+    不拜訪的連鎖品牌直接跳過，不出現在任何結果裡。
     """
     baseline_addrs = [b["地址"] for b in baseline if b["地址"]]
     baseline_names = [b["醫事機構名稱"] for b in baseline if b["醫事機構名稱"]]
 
-    # 建立地址 → 官方名稱的對照表（供換老闆判斷用）
     addr_to_name = {}
     for b in baseline:
         key = extract_key(b["地址"])
         if key:
             addr_to_name[key] = b["醫事機構名稱"]
 
-    new_open, relocated, new_owner = [], [], []
+    new_open, relocated, new_owner, unverifiable = [], [], [], []
+    excluded_count = 0
 
     for p in all_data.values():
-        google_addr = p["地址"]
         google_name = p["名稱"]
+        google_addr = p["地址"]
 
-        # 找是否有吻合的官方地址
+        # ── 步驟 1：排除不拜訪的連鎖品牌 ──
+        if is_excluded_chain(google_name):
+            excluded_count += 1
+            continue
+
+        # ── 步驟 2：地址無法比對 → 待確認 ──
+        if not is_valid_address(google_addr):
+            p["備註"]    = "❓ 地址無法比對"
+            p["原名稱"] = ""
+            unverifiable.append(p)
+            continue
+
+        # ── 步驟 3：找是否有吻合的健保地址 ──
         matched_base_addr = None
         for base_addr in baseline_addrs:
             if is_same_location(google_addr, base_addr):
@@ -261,16 +307,16 @@ def classify_pharmacies(all_data, baseline):
                 break
 
         if matched_base_addr:
-            # 地址相同 → 再比名稱
+            # 地址吻合 → 比名稱，看是否換老闆
             official_name = addr_to_name.get(extract_key(matched_base_addr), "")
             if official_name and not is_similar_name(google_name, official_name):
-                # 地址相同，名稱不同 → 疑似換老闆
                 p["備註"]    = "👤 疑似換老闆／改名"
                 p["原名稱"] = official_name
                 new_owner.append(p)
             # else: 正常藥局，略過
+
         else:
-            # 地址不在名單 → 再比名稱
+            # 地址不在名單 → 比名稱，判斷搬遷或全新
             name_matched = any(is_similar_name(google_name, o) for o in baseline_names)
             if name_matched:
                 p["備註"]   = "🔄 疑似搬遷／二代接班"
@@ -281,7 +327,8 @@ def classify_pharmacies(all_data, baseline):
                 p["原名稱"] = ""
                 new_open.append(p)
 
-    return new_open, relocated, new_owner
+    print(f"   已排除連鎖品牌：{excluded_count} 間")
+    return new_open, relocated, new_owner, unverifiable
 
 
 # ════════════════════════════════════════════
@@ -298,7 +345,7 @@ def write_snapshot(ss, all_data):
     print(f"✅ 快照寫入「{TODAY}」：{len(all_data)} 筆")
 
 def write_result_sheet(ss, title, pharmacies):
-    ws = get_or_create_sheet(ss, title, rows=500)
+    ws = get_or_create_sheet(ss, title, rows=1000)
     ws.append_row(HEADERS_RESULT)
     if pharmacies:
         ws.append_rows([[
@@ -319,21 +366,21 @@ def write_result_sheet(ss, title, pharmacies):
 def send_line(text):
     requests.post(
         "https://api.line.me/v2/bot/message/push",
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {LINE_TOKEN}"},
-        json={"to": LINE_USER_ID,
-              "messages": [{"type": "text", "text": text}]},
+        headers={
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {LINE_TOKEN}",
+        },
+        json={"to": LINE_USER_ID, "messages": [{"type": "text", "text": text}]},
         timeout=10,
     )
 
-def build_message(new_open, relocated, new_owner, total):
-    has_result = any([new_open, relocated, new_owner])
-    lines = [f"🏥 藥局異動報告", f"📅 {TODAY}",
-             f"共比對 {total} 間", "─" * 22]
-
-    if not has_result:
-        lines.append("\n本次無異動紀錄")
-        return "\n".join(lines)
+def build_message(new_open, relocated, new_owner, unverifiable, total, excluded):
+    lines = [
+        "🏥 藥局異動報告",
+        f"📅 {TODAY}",
+        f"共比對 {total} 間（排除連鎖 {excluded} 間）",
+        "─" * 22,
+    ]
 
     def section(icon, label, items, show_original=False):
         if not items:
@@ -347,9 +394,15 @@ def build_message(new_open, relocated, new_owner, total):
         if len(items) > 5:
             lines.append(f"    ...還有 {len(items)-5} 間，見 Sheets")
 
-    section("🆕", "全新開幕", new_open)
-    section("🔄", "疑似搬遷", relocated)
+    section("🆕", "全新開幕",   new_open)
+    section("🔄", "疑似搬遷",   relocated)
     section("👤", "疑似換老闆", new_owner, show_original=True)
+
+    if unverifiable:
+        lines.append(f"\n❓ 待確認地址：{len(unverifiable)} 間")
+
+    if not any([new_open, relocated, new_owner]):
+        lines.append("\n本次無異動紀錄")
 
     return "\n".join(lines)
 
@@ -362,6 +415,7 @@ def main():
     print("=" * 50)
     print(f"  藥局異動追蹤  |  {TODAY}")
     print(f"  網格座標點數：{len(LOCATIONS)}")
+    print(f"  排除連鎖品牌：{', '.join(EXCLUDE_CHAINS)}")
     print("=" * 50)
 
     ss       = get_spreadsheet()
@@ -374,17 +428,23 @@ def main():
     write_snapshot(ss, all_data)
 
     print("\n🔍 比對中...")
-    new_open, relocated, new_owner = classify_pharmacies(all_data, baseline)
+    new_open, relocated, new_owner, unverifiable = classify_pharmacies(all_data, baseline)
 
-    write_result_sheet(ss, "🆕 全新開幕", new_open)
-    write_result_sheet(ss, "🔄 疑似搬遷", relocated)
+    # 計算排除數（總數 - 四類合計 - 快照數差異）
+    excluded = len(all_data) - len(new_open) - len(relocated) - len(new_owner) - len(unverifiable)
+
+    write_result_sheet(ss, "🆕 全新開幕",  new_open)
+    write_result_sheet(ss, "🔄 疑似搬遷",  relocated)
     write_result_sheet(ss, "👤 疑似換老闆", new_owner)
+    write_result_sheet(ss, "❓ 待確認地址", unverifiable)
 
-    print(f"   全新開幕：{len(new_open)} 間")
-    print(f"   疑似搬遷：{len(relocated)} 間")
-    print(f"   疑似換老闆：{len(new_owner)} 間")
+    print(f"   🆕 全新開幕：  {len(new_open)} 間")
+    print(f"   🔄 疑似搬遷：  {len(relocated)} 間")
+    print(f"   👤 疑似換老闆：{len(new_owner)} 間")
+    print(f"   ❓ 待確認地址：{len(unverifiable)} 間")
+    print(f"   🚫 排除連鎖：  {excluded} 間")
 
-    msg = build_message(new_open, relocated, new_owner, len(all_data))
+    msg = build_message(new_open, relocated, new_owner, unverifiable, len(all_data), excluded)
     send_line(msg)
     print("\n📲 LINE 通知已發送")
     print("🎉 完成！")
