@@ -458,7 +458,7 @@ def main():
     send_line(msg)
     print("\n📲 LINE 通知已發送")
     # 清理舊快照（只保留最近 2 個）
-    cleanup_old_snapshots(spreadsheet)
+    cleanup_old_snapshots(ss)
     print("🎉 完成！")
 
 # ════════════════════════════════════════════
