@@ -1,23 +1,36 @@
 """
-pharmacy_analyzer.py
-====================
-藥局輿情追蹤系統 v6（精簡版）
-移除：健保名單比對、留言時間戳追蹤
-保留：評論數變化偵測、五層訊號分析、本週摘要產生
-排程：週一、三、五 09:00（tracker 跑完後一小時）
+pharmacy_tracker.py
+===================
+藥局異動追蹤系統 — GitHub Actions 版 v3
+覆蓋範圍：台北市、新北市、基隆市、桃園市
+
+比對邏輯（全新改版）：
+  以 place_id 為唯一識別，比對本次與上次快照
+  🆕 新出現：place_id 上次沒有、這次有 → 交叉比對健保名單
+  🚪 消失中：place_id 上次有、這次沒有 → 可能關閉
+  👤 改名了：place_id 相同但名稱不一樣 → 可能換老闆
+
+健保 CSV 角色（輔助驗證）：
+  新出現的藥局若不在健保名單 → 最新、最有價值的開發對象
+  新出現的藥局若已在健保名單 → 可能只是剛上 Google Maps
+
+排除品牌：杏一、大樹、丁丁、維康、專品、立赫、光點、
+         康是美、屈臣氏、健康人生、富康活力、優嘉、快樂鳥
+執行排程：週一、三、五 08:00（GitHub Actions 自動觸發）
 """
 
 import os
 import re
 import time
-from datetime import datetime, timezone, timedelta
+import unicodedata
+from datetime import datetime
 
 import gspread
 import requests
 from google.oauth2.service_account import Credentials
 
 # ════════════════════════════════════════════
-#  設定
+#  設定（從 GitHub Secrets 環境變數讀取）
 # ════════════════════════════════════════════
 PLACES_API_KEY   = os.environ["PLACES_API_KEY"]
 SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
@@ -26,78 +39,58 @@ LINE_USER_ID     = os.environ["LINE_USER_ID"]
 CREDENTIALS_FILE = "credentials.json"
 
 TODAY     = datetime.today().strftime("%Y-%m-%d")
-TAIWAN_TZ = timezone(timedelta(hours=8))
+TODAY_INT = datetime.today().strftime("%Y%m%d")
 
-MIN_REVIEW_CHANGE  = 3   # 評論數增加幾則以上才納入分析
-NEW_SHOP_THRESHOLD = 10  # 總評論數 ≤ 此值 → 全新開幕/高潛力頂讓店
-BURST_ABS          = 5   # 短期爆發：絕對增加 ≥ 此值
-BURST_RATE         = 20  # 短期爆發：成長率 ≥ 此值（%）
-NEW_OPEN_DAYS      = 30  # 最早留言距今 ≤ 此天數 → 本月新開幕
-RECENT_OPEN_DAYS   = 90  # 最早留言距今 ≤ 此天數 → 近期開業
+# ════════════════════════════════════════════
+#  不拜訪的連鎖品牌（直接排除）
+# ════════════════════════════════════════════
+EXCLUDE_CHAINS = [
+    "杏一", "大樹", "丁丁", "維康", "專品", "立赫", "光點",
+    "康是美", "屈臣氏", "健康人生", "富康活力", "優嘉", "快樂鳥",
+]
+
+def is_excluded_chain(name: str) -> bool:
+    return any(chain in name for chain in EXCLUDE_CHAINS)
 
 
 # ════════════════════════════════════════════
-#  時間工具
+#  自動產生六角形網格座標（2.5km 間距）
 # ════════════════════════════════════════════
 
-def unix_to_taiwan(unix_ts) -> str:
-    try:
-        dt = datetime.fromtimestamp(int(unix_ts), tz=TAIWAN_TZ)
-        return dt.strftime("%Y-%m-%d %H:%M")
-    except (ValueError, TypeError):
-        return str(unix_ts)
+def generate_grid(city, min_lat, max_lat, min_lon, max_lon, spacing_km=2.5):
+    step_lat = spacing_km / 111.0
+    step_lon = spacing_km / 101.0
+    points, row = [], 0
+    lat = min_lat
+    while lat <= max_lat + step_lat * 0.1:
+        lon = min_lon + (step_lon / 2 if row % 2 else 0)
+        while lon <= max_lon + step_lon * 0.1:
+            points.append((city, f"{lat:.4f},{lon:.4f}", 1500))
+            lon += step_lon
+        lat += step_lat
+        row += 1
+    return points
 
-def days_since(unix_ts) -> int:
-    try:
-        dt  = datetime.fromtimestamp(int(unix_ts), tz=TAIWAN_TZ)
-        now = datetime.now(tz=TAIWAN_TZ)
-        return (now - dt).days
-    except (ValueError, TypeError):
-        return 9999
+REGION_BOUNDS = [
+    ("台北市", 24.985, 25.210, 121.445, 121.650),
+    ("新北市", 24.920, 25.110, 121.370, 121.560),
+    ("新北市", 25.060, 25.185, 121.440, 121.700),
+    ("新北市", 24.930, 25.020, 121.540, 121.820),
+    ("基隆市", 25.080, 25.200, 121.680, 121.810),
+    ("桃園市", 24.930, 25.070, 121.130, 121.370),
+    ("桃園市", 25.010, 25.100, 121.310, 121.430),
+]
 
+def build_locations():
+    seen, locs = set(), []
+    for (city, *bounds) in REGION_BOUNDS:
+        for pt in generate_grid(city, *bounds):
+            if pt[1] not in seen:
+                seen.add(pt[1])
+                locs.append(pt)
+    return locs
 
-# ════════════════════════════════════════════
-#  關鍵字定義
-# ════════════════════════════════════════════
-KEYWORDS = {
-    "人員異動": {
-        "words": ["換藥師", "新藥師", "換老闆", "新老闆", "換人", "接手", "新負責"],
-        "priority": "高", "label": "👤 人員異動",
-    },
-    "藥師好評": {
-        "words": ["藥師很專業", "藥師親切", "藥師好", "藥師耐心", "藥師認真", "藥師用心", "藥師推薦"],
-        "priority": "高", "label": "⭐ 藥師好評",
-    },
-    "新開幕": {
-        "words": ["新開幕", "剛開", "試營運", "開幕", "新店", "grand opening"],
-        "priority": "高", "label": "🎉 新開幕",
-    },
-    "缺貨需求": {
-        "words": ["缺貨", "沒有", "找不到", "缺少", "沒貨", "買不到"],
-        "priority": "中", "label": "📦 缺貨需求",
-    },
-    "促銷活動": {
-        "words": ["優惠", "活動", "折扣", "促銷", "特價", "免費", "便宜"],
-        "priority": "中", "label": "🏷️ 促銷活動",
-    },
-    "負評警示": {
-        "words": ["態度差", "很差", "失望", "不推薦", "爛", "騙", "差評"],
-        "priority": "低", "label": "⚠️ 負評警示",
-    },
-}
-
-def scan_keywords(text: str) -> tuple[list[str], str]:
-    found, priority = [], "低"
-    for _, config in KEYWORDS.items():
-        for word in config["words"]:
-            if word in text:
-                found.append(config["label"])
-                if config["priority"] == "高":
-                    priority = "高"
-                elif config["priority"] == "中" and priority != "高":
-                    priority = "中"
-                break
-    return found, priority
+LOCATIONS = build_locations()
 
 
 # ════════════════════════════════════════════
@@ -112,7 +105,7 @@ def get_spreadsheet():
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
     return gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
 
-def get_or_create_sheet(ss, title, rows=2000, cols=10):
+def get_or_create_sheet(ss, title, rows=3000, cols=12):
     try:
         ws = ss.worksheet(title)
         ws.clear()
@@ -122,284 +115,294 @@ def get_or_create_sheet(ss, title, rows=2000, cols=10):
 
 
 # ════════════════════════════════════════════
-#  載入快照（找評論數有變化的藥局）
+#  載入上次快照（從最近一個日期分頁）
 # ════════════════════════════════════════════
 
-def load_snapshots(ss):
+def load_previous_snapshot(ss) -> dict:
+    """
+    找出 Sheets 裡最近一個日期分頁（格式 YYYY-MM-DD）
+    回傳 dict：{ place_id: { 名稱, 地址, 縣市 } }
+    """
     date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-    date_sheets  = sorted(
-        [ws for ws in ss.worksheets() if date_pattern.match(ws.title)],
-        key=lambda ws: ws.title, reverse=True,
+    all_sheets   = ss.worksheets()
+
+    date_sheets = sorted(
+        [ws for ws in all_sheets if date_pattern.match(ws.title) and ws.title != TODAY],
+        key=lambda ws: ws.title,
+        reverse=True,
     )
-    if len(date_sheets) < 2:
-        print("⚠️  需要至少兩個日期快照才能分析")
-        return None, None
 
-    print(f"📂 快照比對：{date_sheets[1].title} → {date_sheets[0].title}")
+    if not date_sheets:
+        print("⚠️  找不到上次快照，本次只建立基準，下次才能比對")
+        return {}
 
-    def parse(ws):
-        data = ws.get_all_values()
-        if not data:
-            return {}
-        headers = data[0]
-        result  = {}
-        for row in data[1:]:
-            r   = dict(zip(headers, row))
-            pid = r.get("place_id", "").strip()
-            if pid:
-                result[pid] = r
-        return result
+    prev_ws    = date_sheets[0]
+    prev_date  = prev_ws.title
+    print(f"📂 上次快照：{prev_date}")
 
-    return parse(date_sheets[0]), parse(date_sheets[1])
+    data = prev_ws.get_all_values()
+    if not data or len(data) < 2:
+        return {}
 
-
-def find_targets(latest, previous) -> dict:
-    """找出評論數增加 >= MIN_REVIEW_CHANGE 的藥局"""
-    targets = {}
-    for pid, p in latest.items():
-        if pid not in previous:
-            continue
-        try:
-            new_cnt = int(p.get("評論數", 0) or 0)
-            old_cnt = int(previous[pid].get("評論數", 0) or 0)
-            change  = new_cnt - old_cnt
-        except ValueError:
-            continue
-        if change >= MIN_REVIEW_CHANGE:
-            targets[pid] = {
-                **p,
-                "place_id":    pid,
-                "異動類型":   "評論增加",
-                "評論數變化": f"+{change}（{old_cnt}→{new_cnt}）",
-                "健保狀態":   "",
+    headers = data[0]
+    result  = {}
+    for row in data[1:]:
+        r = dict(zip(headers, row))
+        pid = r.get("place_id", "").strip()
+        if pid:
+            result[pid] = {
+                "名稱": r.get("名稱", ""),
+                "地址": r.get("地址", ""),
+                "縣市": r.get("縣市", ""),
             }
-    return targets
+
+    print(f"   載入 {len(result)} 筆上次資料")
+    return result
 
 
-def load_new_pharmacies(ss) -> list[dict]:
-    """載入 tracker 產生的「🆕 新出現藥局」"""
+# ════════════════════════════════════════════
+#  載入健保基準（輔助驗證用）
+# ════════════════════════════════════════════
+
+def load_baseline_addresses(ss) -> set:
+    """
+    從健保基準資料分頁載入有效藥局地址集合。
+    原始 CSV 欄位：0代碼 1名稱 2種類 3電話 4地址 ... 9終止日 12縣市代碼
+    """
+    TARGET = {"63000", "65000", "10017", "68000"}
     try:
-        ws   = ss.worksheet("🆕 新出現藥局")
-        data = ws.get_all_values()
-        if len(data) < 2:
-            return []
-        headers = data[0]
-        return [dict(zip(headers, row)) for row in data[1:] if any(row)]
+        ws = ss.worksheet("健保基準資料")
     except gspread.exceptions.WorksheetNotFound:
-        return []
+        print("⚠️  找不到健保基準資料，跳過健保驗證")
+        return set()
+
+    addrs = set()
+    for row in ws.get_all_values()[1:]:
+        if len(row) < 13:
+            continue
+        if str(row[12]).strip() in TARGET and str(row[9]).strip() >= TODAY_INT:
+            addr = str(row[4]).strip()
+            if addr:
+                addrs.add(normalize_addr(addr))
+
+    print(f"📋 健保基準：{len(addrs)} 筆有效地址")
+    return addrs
+
+def normalize_addr(addr: str) -> str:
+    """簡單正規化地址供健保交叉比對"""
+    addr = unicodedata.normalize("NFKC", addr)
+    addr = addr.replace("臺", "台")
+    addr = re.sub(r"[\s　]", "", addr)
+    addr = re.sub(r"[（(][^）)]*[）)]", "", addr)
+    addr = re.sub(r"\d+[、,，\d]*[樓層].*$", "", addr)
+    return addr.strip()
+
+def is_in_health_insurance(pharmacy: dict, baseline_addrs: set) -> bool:
+    """判斷此藥局是否已在健保名單"""
+    g_addr = normalize_addr(pharmacy.get("地址", ""))
+    if not g_addr:
+        return False
+    # 用包含比對（因格式可能不完全一致）
+    return any(g_addr in b or b in g_addr for b in baseline_addrs if len(b) > 4)
 
 
 # ════════════════════════════════════════════
-#  Google Places API：抓取留言
+#  Google Places API
 # ════════════════════════════════════════════
 
-def fetch_reviews(place_id: str) -> list[dict]:
-    url    = "https://maps.googleapis.com/maps/api/place/details/json"
+def fetch_pharmacies(city, location, radius):
+    url, results = "https://maps.googleapis.com/maps/api/place/nearbysearch/json", []
     params = {
-        "place_id": place_id,
-        "fields":   "reviews",
-        "language": "zh-TW",
-        "key":      PLACES_API_KEY,
+        "location": location, "radius": radius,
+        "type": "pharmacy", "language": "zh-TW", "key": PLACES_API_KEY,
     }
-    try:
-        res = requests.get(url, params=params, timeout=10).json()
-        return res.get("result", {}).get("reviews", [])
-    except Exception as e:
-        print(f"    ⚠️  取得留言失敗：{e}")
-        return []
-
-
-# ════════════════════════════════════════════
-#  五層訊號分析
-# ════════════════════════════════════════════
-
-def analyze_pharmacy(pid: str, pharmacy: dict, reviews: list[dict]) -> dict | None:
-    if not reviews and pharmacy.get("異動類型") != "新出現":
-        return None
-
-    # 關鍵字掃描（所有留言）
-    all_text          = " ".join(r.get("text", "") for r in reviews)
-    signals, priority = scan_keywords(all_text)
-
-    # 總評論數與本次增加數
-    try:
-        total_reviews = int(pharmacy.get("評論數", 0) or 0)
-    except ValueError:
-        total_reviews = 0
-
-    try:
-        change_num = int(re.search(r"\+(\d+)", pharmacy.get("評論數變化", "")).group(1))
-    except (AttributeError, ValueError):
-        change_num = 0
-
-    # ── 層1：短期爆發成長 ─────────────────────────────
-    growth_rate = (change_num / total_reviews * 100) if total_reviews > 0 else 100
-    if change_num >= BURST_ABS or growth_rate >= BURST_RATE:
-        signals.insert(0, "🚀 短期爆發成長")
-        if priority == "低":
-            priority = "中"
-
-    # ── 層2：總評論數個位數 ───────────────────────────
-    if total_reviews <= NEW_SHOP_THRESHOLD:
-        signals.insert(0, "🏪 全新開幕/高潛力頂讓店")
-        priority = "高"
-
-    # ── 層3：最早留言日期偵測 ─────────────────────────
-    oldest_info = ""
-    timestamps  = [r.get("time", 0) for r in reviews if r.get("time")]
-    if timestamps:
-        oldest_ts   = min(timestamps)
-        oldest_age  = days_since(oldest_ts)
-        oldest_date = unix_to_taiwan(oldest_ts)[:10]
-        oldest_info = f"{oldest_date}（距今 {oldest_age} 天）"
-
-        if oldest_age <= NEW_OPEN_DAYS and total_reviews <= 20:
-            signals.insert(0, f"🆕 極可能本月新開（{oldest_info}）")
-            priority = "高"
-        elif oldest_age <= RECENT_OPEN_DAYS and total_reviews <= 30:
-            signals.insert(0, f"📅 近期開業（{oldest_info}）")
-            if priority == "低":
-                priority = "中"
-
-    # ── 層4：複合強訊號 ───────────────────────────────
-    strong = [s for s in signals if s.startswith(("🆕", "🏪", "🚀"))]
-    if len(strong) >= 2:
-        signals.insert(0, "⚡ 強烈訊號（多重指標）")
-        priority = "高"
-
-    # ── 層5：新出現藥局調整 ───────────────────────────
-    if pharmacy.get("異動類型") == "新出現":
-        if priority == "低":
-            priority = "中"
-        if "尚未健保" in pharmacy.get("健保狀態", ""):
-            priority = "高"
-
-    # 格式化留言（含台灣時間）
-    formatted = []
-    for r in reviews[:5]:
-        rating  = int(r.get("rating", 3))
-        text    = r.get("text", "（無文字）").strip()
-        tw_time = unix_to_taiwan(r.get("time", ""))
-        formatted.append(
-            f"  {'⭐'*rating}（{tw_time}）{text[:80]}{'...' if len(text)>80 else ''}"
-        )
-
-    return {
-        "place_id":     pid,
-        "名稱":         pharmacy.get("名稱", ""),
-        "地址":         pharmacy.get("地址", ""),
-        "縣市":         pharmacy.get("縣市", ""),
-        "異動類型":    pharmacy.get("異動類型", "評論增加"),
-        "總評論數":    str(total_reviews),
-        "評論數變化":  pharmacy.get("評論數變化", ""),
-        "成長率":      f"{growth_rate:.1f}%",
-        "最早留言":    oldest_info,
-        "健保狀態":    pharmacy.get("健保狀態", ""),
-        "留言數":      len(reviews),
-        "訊號":        "、".join(signals) if signals else "—",
-        "優先等級":    priority,
-        "留言列表":    formatted,
-    }
-
-
-def run_analysis(targets: dict) -> list[dict]:
-    results = []
-    total   = len(targets)
-
-    for i, (pid, pharmacy) in enumerate(targets.items(), 1):
-        if i == 1 or i % 10 == 0:
-            print(f"  進度：{i}/{total}")
-        reviews = fetch_reviews(pid)
-        time.sleep(0.5)
-        result  = analyze_pharmacy(pid, pharmacy, reviews)
-        if result:
-            results.append(result)
-
-    order = {"高": 0, "中": 1, "低": 2}
-    results.sort(key=lambda x: order.get(x["優先等級"], 1))
+    while True:
+        try:
+            res = requests.get(url, params=params, timeout=10).json()
+        except Exception as e:
+            print(f"    ⚠️  API 錯誤：{e}")
+            break
+        for p in res.get("results", []):
+            results.append({
+                "place_id": p.get("place_id", ""),
+                "名稱":     p.get("name", ""),
+                "地址":     p.get("vicinity", ""),
+                "評分":     str(p.get("rating", "")),
+                "評論數":   str(p.get("user_ratings_total", "")),
+                "縣市":     city,
+            })
+        token = res.get("next_page_token")
+        if not token:
+            break
+        time.sleep(2)
+        params = {"pagetoken": token, "key": PLACES_API_KEY}
     return results
 
+def fetch_all() -> dict:
+    """抓取所有區域藥局，以 place_id 去重，排除連鎖品牌"""
+    all_data, excluded, total = {}, 0, len(LOCATIONS)
+    for i, (city, location, radius) in enumerate(LOCATIONS, 1):
+        if i == 1 or i % 20 == 0:
+            print(f"  進度：{i}/{total}")
+        for p in fetch_pharmacies(city, location, radius):
+            if not p["place_id"]:
+                continue
+            if is_excluded_chain(p["名稱"]):
+                excluded += 1
+                continue
+            if p["place_id"] not in all_data:
+                all_data[p["place_id"]] = p
+        time.sleep(0.5)
+    print(f"  已排除連鎖品牌：{excluded} 筆（重複計算）")
+    return all_data
+
 
 # ════════════════════════════════════════════
-#  產生「本週摘要」（直接複製貼到 Claude.ai）
+#  核心比對：place_id 快照比對
 # ════════════════════════════════════════════
 
-def generate_summary(ss, results: list[dict]):
-    ws    = get_or_create_sheet(ss, "本週摘要", rows=500, cols=2)
-    high  = [r for r in results if r["優先等級"] == "高"]
-    mid   = [r for r in results if r["優先等級"] == "中"]
-    low   = [r for r in results if r["優先等級"] == "低"]
+def compare_snapshots(today: dict, previous: dict, baseline_addrs: set):
+    """
+    以 place_id 比對今日與上次快照，分三類：
+      new_with_insurance    🆕 新出現 + 已在健保
+      new_without_insurance 🆕 新出現 + 未在健保（最高優先）
+      disappeared           🚪 消失（可能關閉）
+      renamed               👤 改名（可能換老闆）
+    """
+    today_ids    = set(today.keys())
+    previous_ids = set(previous.keys())
 
-    lines = [
-        "以下是本次藥局新增留言資料，請幫我分析並給出拜訪建議：",
-        f"（分析日期：{TODAY}，共 {len(results)} 間藥局有異動）",
-        "",
-        "【請回答】",
-        "1. 最值得優先拜訪的前 5 間，說明原因",
-        "2. 有哪些店家出現人員異動、全新開幕或爆發成長訊號",
-        "3. 哪些區域最近比較活躍",
-        "4. 給我本次的具體拜訪建議",
-        "",
-        "=" * 40,
-    ]
+    # 新出現的 place_id
+    new_ids = today_ids - previous_ids
+    new_with    = []   # 已在健保
+    new_without = []   # 未在健保（全新！）
 
-    def add_section(label, items):
-        if not items:
-            return
-        lines.append(f"\n{label}（{len(items)} 間）")
-        lines.append("-" * 30)
-        for r in items:
-            lines.append(f"【{r['名稱']}】{r['縣市']} {r['地址']}")
-            lines.append(
-                f"  {r['異動類型']} ｜ {r['評論數變化']} ｜"
-                f" 總評論數：{r['總評論數']} ｜ 成長率：{r['成長率']}"
-            )
-            if r.get("最早留言"):
-                lines.append(f"  最早留言：{r['最早留言']}")
-            if r["訊號"] != "—":
-                lines.append(f"  偵測訊號：{r['訊號']}")
-            if r.get("健保狀態"):
-                lines.append(f"  健保狀態：{r['健保狀態']}")
-            lines.append(f"  留言（{r['留言數']} 則）：")
-            for line in r["留言列表"]:
-                lines.append(line)
-            lines.append("")
+    for pid in new_ids:
+        p = today[pid]
+        if is_in_health_insurance(p, baseline_addrs):
+            p["健保狀態"] = "✅ 已有健保"
+            new_with.append(p)
+        else:
+            p["健保狀態"] = "❗ 尚未健保"
+            new_without.append(p)
 
-    add_section("🔥 高優先", high)
-    add_section("📋 中優先", mid)
-    add_section("📌 低優先", low)
+    # 消失的 place_id
+    disappeared_ids = previous_ids - today_ids
+    disappeared = [previous[pid] | {"place_id": pid} for pid in disappeared_ids]
 
-    ws.append_rows([[line] for line in lines])
-    print(f"✅ 本週摘要已寫入（{len(lines)} 行）")
+    # 改名（place_id 相同，名稱不同）
+    renamed = []
+    for pid in today_ids & previous_ids:
+        t_name = today[pid]["名稱"]
+        p_name = previous[pid]["名稱"]
+        if t_name != p_name:
+            renamed.append({
+                **today[pid],
+                "原名稱": p_name,
+            })
+
+    return new_without, new_with, disappeared, renamed
+
+
+# ════════════════════════════════════════════
+#  寫入 Google Sheets
+# ════════════════════════════════════════════
+
+HEADERS_SNAPSHOT = ["place_id", "名稱", "地址", "評分", "評論數", "縣市"]
+HEADERS_NEW      = ["發現日期", "place_id", "名稱", "地址", "縣市", "健保狀態"]
+HEADERS_GONE     = ["發現日期", "place_id", "名稱", "地址", "縣市"]
+HEADERS_RENAMED  = ["發現日期", "place_id", "現名稱", "原名稱", "地址", "縣市"]
+
+def write_snapshot(ss, all_data):
+    ws = get_or_create_sheet(ss, TODAY, rows=5000)
+    ws.append_row(HEADERS_SNAPSHOT)
+    ws.append_rows([[p[h] for h in HEADERS_SNAPSHOT] for p in all_data.values()])
+    print(f"✅ 快照寫入「{TODAY}」：{len(all_data)} 筆")
+
+def write_new_sheet(ss, new_without, new_with):
+    ws = get_or_create_sheet(ss, "🆕 新出現藥局", rows=500)
+    ws.append_row(HEADERS_NEW)
+    rows = []
+    # 未有健保的排在前面（優先級最高）
+    for p in new_without + new_with:
+        rows.append([TODAY, p["place_id"], p["名稱"],
+                     p["地址"], p["縣市"], p["健保狀態"]])
+    if rows:
+        ws.append_rows(rows)
+
+def write_disappeared_sheet(ss, disappeared):
+    ws = get_or_create_sheet(ss, "🚪 消失藥局", rows=500)
+    ws.append_row(HEADERS_GONE)
+    if disappeared:
+        ws.append_rows([[TODAY, p["place_id"], p["名稱"],
+                         p["地址"], p["縣市"]] for p in disappeared])
+
+def write_renamed_sheet(ss, renamed):
+    ws = get_or_create_sheet(ss, "👤 改名藥局", rows=500)
+    ws.append_row(HEADERS_RENAMED)
+    if renamed:
+        ws.append_rows([[TODAY, p["place_id"], p["名稱"],
+                         p["原名稱"], p["地址"], p["縣市"]] for p in renamed])
 
 
 # ════════════════════════════════════════════
 #  LINE 通知
 # ════════════════════════════════════════════
 
-def send_line(text: str):
+def send_line(text):
     requests.post(
         "https://api.line.me/v2/bot/message/push",
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {LINE_TOKEN}"},
+        headers={
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {LINE_TOKEN}",
+        },
         json={"to": LINE_USER_ID, "messages": [{"type": "text", "text": text}]},
         timeout=10,
     )
 
-def build_line_message(results: list[dict]) -> str:
-    high     = sum(1 for r in results if r["優先等級"] == "高")
-    mid      = sum(1 for r in results if r["優先等級"] == "中")
-    new_open = sum(1 for r in results if "極可能本月新開" in r["訊號"])
-    burst    = sum(1 for r in results if "短期爆發成長" in r["訊號"])
-    strong   = sum(1 for r in results if "強烈訊號" in r["訊號"])
+def build_message(new_without, new_with, disappeared, renamed, total):
+    lines = [
+        "🏥 藥局異動報告",
+        f"📅 {TODAY}",
+        f"本次掃描 {total} 間",
+        "─" * 22,
+    ]
 
-    lines = [f"📊 藥局輿情報告", f"📅 {TODAY}",
-             f"有異動藥局：{len(results)} 間", "─" * 20]
-    if strong:   lines.append(f"⚡ 強烈訊號：{strong} 間")
-    if new_open: lines.append(f"🆕 本月新開幕：{new_open} 間")
-    if burst:    lines.append(f"🚀 短期爆發：{burst} 間")
-    lines += [f"🔥 高優先：{high} 間", f"📋 中優先：{mid} 間",
-              "", "請開啟 Sheets", "複製「本週摘要」貼到 Claude.ai"]
+    def section(icon, label, items, name_key="名稱", extra_key=None, extra_label=""):
+        if not items:
+            return
+        lines.append(f"\n{icon} {label}：{len(items)} 間")
+        for p in items[:5]:
+            lines.append(f"  • {p[name_key]}")
+            lines.append(f"    📍 {p['地址']}")
+            if extra_key and p.get(extra_key):
+                lines.append(f"    {extra_label}{p[extra_key]}")
+        if len(items) > 5:
+            lines.append(f"    ...還有 {len(items)-5} 間，見 Sheets")
+
+    # 未有健保的新藥局優先顯示
+    if new_without:
+        lines.append(f"\n🆕 全新藥局（尚未健保）：{len(new_without)} 間  ← 最優先！")
+        for p in new_without[:5]:
+            lines.append(f"  • {p['名稱']}")
+            lines.append(f"    📍 {p['地址']}  {p['健保狀態']}")
+        if len(new_without) > 5:
+            lines.append(f"    ...還有 {len(new_without)-5} 間，見 Sheets")
+
+    if new_with:
+        lines.append(f"\n🆕 新出現藥局（已有健保）：{len(new_with)} 間")
+        for p in new_with[:3]:
+            lines.append(f"  • {p['名稱']}")
+            lines.append(f"    📍 {p['地址']}")
+        if len(new_with) > 3:
+            lines.append(f"    ...還有 {len(new_with)-3} 間，見 Sheets")
+
+    section("🚪", "消失藥局",  disappeared)
+    section("👤", "改名藥局",  renamed, extra_key="原名稱", extra_label="原名：")
+
+    if not any([new_without, new_with, disappeared, renamed]):
+        lines.append("\n本次無異動紀錄")
+
     return "\n".join(lines)
 
 
@@ -409,57 +412,69 @@ def build_line_message(results: list[dict]) -> str:
 
 def main():
     print("=" * 50)
-    print(f"  藥局輿情追蹤 v6  |  {TODAY}")
+    print(f"  藥局異動追蹤  v3  |  {TODAY}")
+    print(f"  網格座標點數：{len(LOCATIONS)}")
     print("=" * 50)
 
     ss = get_spreadsheet()
 
-    # 1. 載入兩個快照
-    latest, previous = load_snapshots(ss)
-    if latest is None:
-        send_line(f"📊 輿情系統\n{TODAY}\n\n⚠️ 快照不足，請等 tracker 累積兩次資料")
+    # 1. 載入上次快照
+    previous = load_previous_snapshot(ss)
+
+    # 2. 載入健保基準（輔助驗證）
+    baseline_addrs = load_baseline_addresses(ss)
+
+    # 3. 抓取今日 Google Places 資料
+    print(f"\n📡 抓取 Google Places（{len(LOCATIONS)} 個座標點）...")
+    today = fetch_all()
+    print(f"✅ 共抓到 {len(today)} 間（去重複、排除連鎖後）")
+
+    # 4. 存今日快照
+    write_snapshot(ss, today)
+
+    # 5. 與上次比對
+    if not previous:
+        print("\n⚠️  無上次快照可比對，下次執行才會有異動報告")
+        send_line(f"🏥 藥局追蹤系統\n📅 {TODAY}\n\n首次執行完成！\n共建立 {len(today)} 間藥局基準\n下次執行將開始比對異動")
         return
 
-    # 2. 找目標藥局（評論增加 + 新出現）
-    targets = find_targets(latest, previous)
-    for p in load_new_pharmacies(ss):
-        pid = p.get("place_id", "").strip()
-        if pid and pid not in targets:
-            targets[pid] = {
-                **latest.get(pid, {}),
-                "place_id":   pid,
-                "名稱":       p.get("名稱", ""),
-                "地址":       p.get("Google地址", p.get("地址", "")),
-                "縣市":       p.get("縣市", ""),
-                "異動類型":  "新出現",
-                "評論數變化": f"初次出現（{latest.get(pid, {}).get('評論數', 0)} 則）",
-                "健保狀態":  p.get("健保狀態", ""),
-            }
+    print("\n🔍 比對 place_id 異動...")
+    new_without, new_with, disappeared, renamed = compare_snapshots(
+        today, previous, baseline_addrs
+    )
 
-    print(f"🔍 分析目標：{len(targets)} 間藥局")
+    # 6. 寫入結果分頁
+    write_new_sheet(ss, new_without, new_with)
+    write_disappeared_sheet(ss, disappeared)
+    write_renamed_sheet(ss, renamed)
 
-    if not targets:
-        send_line(f"📊 藥局輿情\n📅 {TODAY}\n\n本次無評論異動")
-        return
+    print(f"   🆕 新出現（未健保）：{len(new_without)} 間")
+    print(f"   🆕 新出現（已健保）：{len(new_with)} 間")
+    print(f"   🚪 消失：           {len(disappeared)} 間")
+    print(f"   👤 改名：           {len(renamed)} 間")
 
-    # 3. 抓留言 + 分析
-    print(f"\n📡 抓取留言並分析中...")
-    results = run_analysis(targets)
-
-    # 4. 產生摘要
-    generate_summary(ss, results)
-
-    # 5. LINE 通知
-    msg = build_line_message(results)
+    # 7. LINE 通知
+    msg = build_message(new_without, new_with, disappeared, renamed, len(today))
     send_line(msg)
-
-    strong = sum(1 for r in results if "強烈訊號" in r["訊號"])
-    high   = sum(1 for r in results if r["優先等級"] == "高")
-    print(f"\n   ⚡ 強烈訊號：{strong} 間")
-    print(f"   🔥 高優先：  {high} 間")
-    print(f"   📊 總分析：  {len(results)} 間")
     print("\n📲 LINE 通知已發送")
+    # 清理舊快照（只保留最近 2 個）
+    cleanup_old_snapshots(spreadsheet)
     print("🎉 完成！")
+
+# ════════════════════════════════════════════
+#  快照自動清理（只保留最近 2 個）
+# ════════════════════════════════════════════
+
+def cleanup_old_snapshots(ss, keep: int = 2):
+    """刪除舊的日期快照，只保留最近 keep 個"""
+    date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    date_sheets  = sorted(
+        [ws for ws in ss.worksheets() if date_pattern.match(ws.title)],
+        key=lambda ws: ws.title, reverse=True,
+    )
+    for ws in date_sheets[keep:]:
+        print(f"🗑️  刪除舊快照：{ws.title}")
+        ss.del_worksheet(ws)
 
 
 if __name__ == "__main__":
