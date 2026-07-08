@@ -21,7 +21,7 @@ jobs:
           python-version: "3.11"
 
       - name: 安裝套件
-        run: pip install gspread google-auth requests
+        run: pip install gspread google-auth requests tenacity
 
       - name: 寫入 Google 憑證
         run: echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > credentials.json
