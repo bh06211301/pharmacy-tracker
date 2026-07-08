@@ -28,22 +28,41 @@ from datetime import datetime, timezone, timedelta
 import gspread
 import requests
 from google.oauth2.service_account import Credentials
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 # ════════════════════════════════════════════
 #  設定（從 GitHub Secrets 環境變數讀取）
 # ════════════════════════════════════════════
-PLACES_API_KEY   = os.environ["PLACES_API_KEY"]
-SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
-LINE_TOKEN       = os.environ["LINE_TOKEN"]
-LINE_USER_ID     = os.environ["LINE_USER_ID"]
-CREDENTIALS_FILE = "credentials.json"
+PLACES_API_KEY      = os.environ["PLACES_API_KEY"]
+SPREADSHEET_ID      = os.environ["SPREADSHEET_ID"]
+LINE_TOKEN          = os.environ["LINE_TOKEN"]
+LINE_USER_ID        = os.environ["LINE_USER_ID"]
+CREDENTIALS_FILE    = "credentials.json"
+SMART_BOARD_URL     = "https://still-meadow-0efd.bh06211301.workers.dev"
 
 TAIWAN_TZ = timezone(timedelta(hours=8))
 TODAY     = datetime.now(tz=TAIWAN_TZ).strftime("%Y-%m-%d")
 TODAY_INT = datetime.now(tz=TAIWAN_TZ).strftime("%Y%m%d")
 
 MIN_SNAPSHOT_SIZE = 100   # 抓到筆數低於此值 → 視為異常，不覆蓋快照
+
+
+# ════════════════════════════════════════════
+#  Sheets API 重試（503/500/429 暫時性錯誤）
+# ════════════════════════════════════════════
+
+def _is_transient_sheets_error(exc) -> bool:
+    return isinstance(exc, gspread.exceptions.APIError) and any(
+        code in str(exc) for code in ("[503]", "[500]", "[429]")
+    )
+
+_sheets_retry = retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=5, max=60),
+    retry=retry_if_exception(_is_transient_sheets_error),
+    reraise=True,
+)
+
 
 # ════════════════════════════════════════════
 #  不拜訪的連鎖品牌（直接排除）
@@ -101,6 +120,7 @@ LOCATIONS = build_locations()
 #  Google Sheets 連線
 # ════════════════════════════════════════════
 
+@_sheets_retry
 def get_spreadsheet():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -109,6 +129,7 @@ def get_spreadsheet():
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
     return gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
 
+@_sheets_retry
 def get_or_create_sheet(ss, title, rows=3000, cols=12):
     try:
         ws = ss.worksheet(title)
@@ -116,6 +137,14 @@ def get_or_create_sheet(ss, title, rows=3000, cols=12):
     except gspread.exceptions.WorksheetNotFound:
         ws = ss.add_worksheet(title=title, rows=rows, cols=cols)
     return ws
+
+@_sheets_retry
+def _worksheets(ss):
+    return ss.worksheets()
+
+@_sheets_retry
+def _get_all_values(ws):
+    return ws.get_all_values()
 
 
 # ════════════════════════════════════════════
@@ -128,7 +157,7 @@ def load_previous_snapshot(ss) -> dict:
     回傳 dict：{ place_id: { 名稱, 地址, 縣市 } }
     """
     date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-    all_sheets   = ss.worksheets()
+    all_sheets   = _worksheets(ss)
 
     date_sheets = sorted(
         [ws for ws in all_sheets if date_pattern.match(ws.title) and ws.title != TODAY],
@@ -144,7 +173,7 @@ def load_previous_snapshot(ss) -> dict:
     prev_date  = prev_ws.title
     print(f"📂 上次快照：{prev_date}")
 
-    data = prev_ws.get_all_values()
+    data = _get_all_values(prev_ws)
     if not data or len(data) < 2:
         return {}
 
@@ -181,7 +210,7 @@ def load_baseline_addresses(ss) -> set:
         return set()
 
     addrs = set()
-    for row in ws.get_all_values()[1:]:
+    for row in _get_all_values(ws)[1:]:
         if len(row) < 13:
             continue
         if str(row[12]).strip() in TARGET and str(row[9]).strip() >= TODAY_INT:
@@ -377,6 +406,46 @@ def send_line(text):
         timeout=10,
     )
 
+
+# ════════════════════════════════════════════
+#  推送新藥局到業務智能規劃系統待辦清單
+# ════════════════════════════════════════════
+
+def post_new_pharmacies_to_smart_board(new_without: list, new_with: list) -> tuple[int, int]:
+    """將新發現藥局自動寫入 pharmacy-smart-board 的新開藥局待辦池"""
+    all_new = new_without + new_with
+    if not all_new:
+        return 0, 0
+
+    url = f"{SMART_BOARD_URL}/todos-v2"
+    success, failed = 0, 0
+
+    for p in all_new:
+        payload = {
+            "task":           p["名稱"],
+            "quadrant":       "newph",
+            "pharmacyId":     p.get("place_id", ""),
+            "pharmacyName":   p["名稱"],
+            "newPhAddress":   p.get("地址", ""),
+            "newPhCity":      p.get("縣市", ""),
+            "healthInsurance": p.get("健保狀態", ""),
+            "source":         "tracker",
+            "type":           "other",
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code == 200:
+                success += 1
+            else:
+                failed += 1
+                print(f"    ⚠️ 寫入失敗：{p['名稱']} (HTTP {resp.status_code})")
+        except Exception as e:
+            failed += 1
+            print(f"    ⚠️ 寫入失敗：{p['名稱']} ({e})")
+
+    print(f"📋 已推送至業務系統：成功 {success} 筆，失敗 {failed} 筆")
+    return success, failed
+
 def build_message(new_without, new_with, disappeared, renamed, total):
     lines = [
         "🏥 藥局異動報告",
@@ -481,6 +550,12 @@ def main():
     msg = build_message(new_without, new_with, disappeared, renamed, len(today))
     send_line(msg)
     print("\n📲 LINE 通知已發送")
+
+    # 8. 推送新藥局到業務智能規劃系統
+    if new_without or new_with:
+        print("\n📤 推送新藥局至業務系統...")
+        post_new_pharmacies_to_smart_board(new_without, new_with)
+
     # 清理舊快照（只保留最近 2 個）
     cleanup_old_snapshots(ss)
     print("🎉 完成！")
@@ -493,7 +568,7 @@ def cleanup_old_snapshots(ss, keep: int = 2):
     """刪除舊的日期快照，只保留最近 keep 個"""
     date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
     date_sheets  = sorted(
-        [ws for ws in ss.worksheets() if date_pattern.match(ws.title)],
+        [ws for ws in _worksheets(ss) if date_pattern.match(ws.title)],
         key=lambda ws: ws.title, reverse=True,
     )
     for ws in date_sheets[keep:]:
