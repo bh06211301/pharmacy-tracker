@@ -23,11 +23,12 @@ import os
 import re
 import time
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 import gspread
 import requests
 from google.oauth2.service_account import Credentials
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ════════════════════════════════════════════
 #  設定（從 GitHub Secrets 環境變數讀取）
@@ -38,8 +39,11 @@ LINE_TOKEN       = os.environ["LINE_TOKEN"]
 LINE_USER_ID     = os.environ["LINE_USER_ID"]
 CREDENTIALS_FILE = "credentials.json"
 
-TODAY     = datetime.today().strftime("%Y-%m-%d")
-TODAY_INT = datetime.today().strftime("%Y%m%d")
+TAIWAN_TZ = timezone(timedelta(hours=8))
+TODAY     = datetime.now(tz=TAIWAN_TZ).strftime("%Y-%m-%d")
+TODAY_INT = datetime.now(tz=TAIWAN_TZ).strftime("%Y%m%d")
+
+MIN_SNAPSHOT_SIZE = 100   # 抓到筆數低於此值 → 視為異常，不覆蓋快照
 
 # ════════════════════════════════════════════
 #  不拜訪的連鎖品牌（直接排除）
@@ -210,17 +214,30 @@ def is_in_health_insurance(pharmacy: dict, baseline_addrs: set) -> bool:
 #  Google Places API
 # ════════════════════════════════════════════
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True,
+)
+def _call_places_api(url: str, params: dict) -> dict:
+    res = requests.get(url, params=params, timeout=15).json()
+    status = res.get("status", "")
+    if status not in ("OK", "ZERO_RESULTS"):
+        raise Exception(f"Places API status={status}")
+    return res
+
 def fetch_pharmacies(city, location, radius):
-    url, results = "https://maps.googleapis.com/maps/api/place/nearbysearch/json", []
-    params = {
+    url     = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+    results = []
+    params  = {
         "location": location, "radius": radius,
         "type": "pharmacy", "language": "zh-TW", "key": PLACES_API_KEY,
     }
     while True:
         try:
-            res = requests.get(url, params=params, timeout=10).json()
+            res = _call_places_api(url, params)
         except Exception as e:
-            print(f"    ⚠️  API 錯誤：{e}")
+            print(f"    ⚠️  API 錯誤（已重試3次）：{e}")
             break
         for p in res.get("results", []):
             results.append({
@@ -429,7 +446,14 @@ def main():
     today = fetch_all()
     print(f"✅ 共抓到 {len(today)} 間（去重複、排除連鎖後）")
 
-    # 4. 存今日快照
+    # 4. 存今日快照（筆數異常時不覆蓋，保護對照基準）
+    if len(today) < MIN_SNAPSHOT_SIZE:
+        msg = (f"⚠️ 藥局追蹤異常\n📅 {TODAY}\n\n"
+               f"只抓到 {len(today)} 間（門檻 {MIN_SNAPSHOT_SIZE}）\n"
+               f"API 可能有問題，快照未寫入\n請至 GitHub Actions 查看 log")
+        send_line(msg)
+        print(f"❌ 筆數 {len(today)} < {MIN_SNAPSHOT_SIZE}，中止以保護對照基準")
+        return
     write_snapshot(ss, today)
 
     # 5. 與上次比對
