@@ -423,7 +423,7 @@ def post_new_pharmacies_to_smart_board(new_without: list, new_with: list) -> tup
     for p in all_new:
         payload = {
             "task":           p["名稱"],
-            "quadrant":       "newph",
+            "quadrant":       "pending_newph",
             "pharmacyId":     p.get("place_id", ""),
             "pharmacyName":   p["名稱"],
             "newPhAddress":   p.get("地址", ""),
