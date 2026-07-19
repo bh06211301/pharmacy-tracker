@@ -101,9 +101,12 @@ REGION_BOUNDS = [
     ("新北市", 24.920, 25.110, 121.370, 121.560),
     ("新北市", 25.060, 25.185, 121.440, 121.700),
     ("新北市", 24.930, 25.020, 121.540, 121.820),
+    ("新北市", 24.870, 24.980, 121.290, 121.430),  # 鶯歌/三峽（原框西界有漏）
     ("基隆市", 25.080, 25.200, 121.680, 121.810),
     ("桃園市", 24.930, 25.070, 121.130, 121.370),
     ("桃園市", 25.010, 25.100, 121.310, 121.430),
+    ("桃園市", 24.820, 24.940, 121.080, 121.410),  # 楊梅/龍潭/大溪南（原框緯度不夠南）
+    ("桃園市", 24.900, 25.070, 121.010, 121.180),  # 觀音/新屋（原框經度不夠西）
 ]
 
 def build_locations():
@@ -277,6 +280,7 @@ def fetch_pharmacies(city, location, radius):
             print(f"    ⚠️  API 錯誤（已重試3次）：{e}")
             break
         for p in res.get("results", []):
+            loc = p.get("geometry", {}).get("location", {})
             results.append({
                 "place_id": p.get("place_id", ""),
                 "名稱":     p.get("name", ""),
@@ -284,6 +288,8 @@ def fetch_pharmacies(city, location, radius):
                 "評分":     str(p.get("rating", "")),
                 "評論數":   str(p.get("user_ratings_total", "")),
                 "縣市":     city,
+                "緯度":     str(loc.get("lat", "")),
+                "經度":     str(loc.get("lng", "")),
             })
         token = res.get("next_page_token")
         if not token:
@@ -365,8 +371,8 @@ def compare_snapshots(today: dict, previous: dict, baseline_addrs: set):
 #  寫入 Google Sheets
 # ════════════════════════════════════════════
 
-HEADERS_SNAPSHOT = ["place_id", "名稱", "地址", "評分", "評論數", "縣市"]
-HEADERS_NEW      = ["發現日期", "place_id", "名稱", "地址", "縣市", "健保狀態"]
+HEADERS_SNAPSHOT = ["place_id", "名稱", "地址", "評分", "評論數", "縣市", "緯度", "經度"]
+HEADERS_NEW      = ["發現日期", "place_id", "名稱", "地址", "縣市", "健保狀態", "緯度", "經度"]
 HEADERS_GONE     = ["發現日期", "place_id", "名稱", "地址", "縣市"]
 HEADERS_RENAMED  = ["發現日期", "place_id", "現名稱", "原名稱", "地址", "縣市"]
 
@@ -383,7 +389,8 @@ def write_new_sheet(ss, new_without, new_with):
     # 未有健保的排在前面（優先級最高）
     for p in new_without + new_with:
         rows.append([TODAY, p["place_id"], p["名稱"],
-                     p["地址"], p["縣市"], p["健保狀態"]])
+                     p["地址"], p["縣市"], p["健保狀態"],
+                     p.get("緯度", ""), p.get("經度", "")])
     if rows:
         ws.append_rows(rows)
 
@@ -442,6 +449,8 @@ def post_new_pharmacies_to_smart_board(new_without: list, new_with: list) -> tup
             "healthInsurance": p.get("健保狀態", ""),
             "source":         "tracker",
             "type":           "other",
+            "lat":            p.get("緯度", ""),
+            "lng":            p.get("經度", ""),
         }
         try:
             resp = requests.post(url, json=payload, timeout=10)
