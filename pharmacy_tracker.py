@@ -1,10 +1,10 @@
 """
 pharmacy_tracker.py
 ===================
-藥局異動追蹤系統 — GitHub Actions 版 v3
-覆蓋範圍：台北市、新北市、基隆市、桃園市
+藥局異動追蹤系統 — GitHub Actions 版 v4
+覆蓋範圍：台北市、新北市、基隆市、桃園市（585 個網格座標點）
 
-比對邏輯（全新改版）：
+比對邏輯：
   以 place_id 為唯一識別，比對本次與上次快照
   🆕 新出現：place_id 上次沒有、這次有 → 交叉比對健保名單
   🚪 消失中：place_id 上次有、這次沒有 → 可能關閉
@@ -16,7 +16,18 @@ pharmacy_tracker.py
 
 排除品牌：杏一、大樹、丁丁、維康、專品、立赫、光點、
          康是美、屈臣氏、健康人生、富康活力、優嘉、快樂鳥
-執行排程：週一、三、五 08:00（GitHub Actions 自動觸發）
+執行排程：每月 1 號 08:00（GitHub Actions 自動觸發）
+
+v4 變更（2026-07-30 修正 Places API 帳單事件）：
+  - 舊版 legacy Nearby Search（含 rating/評論數）落在 Enterprise 計費層，
+    免費額度僅 1,000 次/月，585 點 × 週三次 = 每月上萬次呼叫，單月被
+    收費超過 $1,000 美金
+  - 改用新版 Places API（searchNearby v1），FieldMask 只要 Pro 層欄位
+    （id/名稱/地址/座標），免費額度提高到 5,000 次/月、單價也更低
+  - 新版 API 不支援分頁（單次最多 20 筆），故不再有一個座標點打 2-3
+    次的狀況，呼叫次數等於座標點數
+  - 排程從週三次改成月一次：585 點 × 1 次/月 遠低於 5,000 次免費額度，
+    理論上可以做到完全免費
 """
 
 import os
@@ -62,8 +73,9 @@ _sheets_retry = retry(
 class PlacesApiPermanentError(RuntimeError):
     pass
 
-# Places API 暫時性錯誤：速率限制、未知 → 重試
-_TRANSIENT_PLACES_STATUSES = {"OVER_QUERY_LIMIT", "UNKNOWN_ERROR"}
+# 只要求 Pro 層欄位（不含 rating/評論數等 Enterprise 層欄位），
+# 免費額度較高（5,000 次/月）、單價也較低
+PLACES_FIELD_MASK = "places.id,places.displayName,places.formattedAddress,places.location"
 
 
 # ════════════════════════════════════════════
@@ -254,48 +266,59 @@ def is_in_health_insurance(pharmacy: dict, baseline_addrs: set) -> bool:
     retry=retry_if_exception(lambda e: not isinstance(e, PlacesApiPermanentError)),
     reraise=True,
 )
-def _call_places_api(url: str, params: dict) -> dict:
-    res = requests.get(url, params=params, timeout=15).json()
-    status = res.get("status", "")
-    if status in ("OK", "ZERO_RESULTS"):
-        return res
-    if status not in _TRANSIENT_PLACES_STATUSES:
-        # REQUEST_DENIED, INVALID_REQUEST 等永久性錯誤，直接拋出不重試
-        raise PlacesApiPermanentError(f"Places API 永久錯誤: {status}（請檢查 API Key 是否有效）")
-    raise Exception(f"Places API status={status}")
+def _call_places_api(body: dict) -> dict:
+    resp = requests.post(
+        "https://places.googleapis.com/v1/places:searchNearby",
+        headers={
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": PLACES_API_KEY,
+            "X-Goog-FieldMask": PLACES_FIELD_MASK,
+        },
+        json=body,
+        timeout=15,
+    )
+    if resp.status_code == 200:
+        return resp.json()
+    if resp.status_code in (429, 500, 502, 503):
+        raise Exception(f"Places API 暫時性錯誤 HTTP {resp.status_code}")
+    # 400/401/403 等 → key 無效或請求格式錯誤，屬永久性錯誤，直接中止不重試
+    raise PlacesApiPermanentError(
+        f"Places API 永久錯誤: HTTP {resp.status_code} {resp.text[:200]}（請檢查 API Key 是否有效）"
+    )
 
 def fetch_pharmacies(city, location, radius):
-    url     = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-    results = []
-    params  = {
-        "location": location, "radius": radius,
-        "type": "pharmacy", "language": "zh-TW", "key": PLACES_API_KEY,
+    lat, lng = location.split(",")
+    body = {
+        "includedTypes": ["pharmacy"],
+        "maxResultCount": 20,
+        "rankPreference": "DISTANCE",
+        "languageCode": "zh-TW",
+        "locationRestriction": {
+            "circle": {
+                "center": {"latitude": float(lat), "longitude": float(lng)},
+                "radius": float(radius),
+            }
+        },
     }
-    while True:
-        try:
-            res = _call_places_api(url, params)
-        except PlacesApiPermanentError:
-            raise  # 往上傳遞，讓 main() 處理
-        except Exception as e:
-            print(f"    ⚠️  API 錯誤（已重試3次）：{e}")
-            break
-        for p in res.get("results", []):
-            loc = p.get("geometry", {}).get("location", {})
-            results.append({
-                "place_id": p.get("place_id", ""),
-                "名稱":     p.get("name", ""),
-                "地址":     p.get("vicinity", ""),
-                "評分":     str(p.get("rating", "")),
-                "評論數":   str(p.get("user_ratings_total", "")),
-                "縣市":     city,
-                "緯度":     str(loc.get("lat", "")),
-                "經度":     str(loc.get("lng", "")),
-            })
-        token = res.get("next_page_token")
-        if not token:
-            break
-        time.sleep(2)
-        params = {"pagetoken": token, "key": PLACES_API_KEY}
+    try:
+        res = _call_places_api(body)
+    except PlacesApiPermanentError:
+        raise  # 往上傳遞，讓 main() 處理
+    except Exception as e:
+        print(f"    ⚠️  API 錯誤（已重試3次）：{e}")
+        return []
+
+    results = []
+    for p in res.get("places", []):
+        loc = p.get("location", {})
+        results.append({
+            "place_id": p.get("id", ""),
+            "名稱":     p.get("displayName", {}).get("text", ""),
+            "地址":     p.get("formattedAddress", ""),
+            "縣市":     city,
+            "緯度":     str(loc.get("latitude", "")),
+            "經度":     str(loc.get("longitude", "")),
+        })
     return results
 
 def fetch_all() -> dict:
@@ -371,7 +394,7 @@ def compare_snapshots(today: dict, previous: dict, baseline_addrs: set):
 #  寫入 Google Sheets
 # ════════════════════════════════════════════
 
-HEADERS_SNAPSHOT = ["place_id", "名稱", "地址", "評分", "評論數", "縣市", "緯度", "經度"]
+HEADERS_SNAPSHOT = ["place_id", "名稱", "地址", "縣市", "緯度", "經度"]
 HEADERS_NEW      = ["發現日期", "place_id", "名稱", "地址", "縣市", "健保狀態", "緯度", "經度"]
 HEADERS_GONE     = ["發現日期", "place_id", "名稱", "地址", "縣市"]
 HEADERS_RENAMED  = ["發現日期", "place_id", "現名稱", "原名稱", "地址", "縣市"]
@@ -518,7 +541,7 @@ def build_message(new_without, new_with, disappeared, renamed, total):
 
 def main():
     print("=" * 50)
-    print(f"  藥局異動追蹤  v3  |  {TODAY}")
+    print(f"  藥局異動追蹤  v4  |  {TODAY}")
     print(f"  網格座標點數：{len(LOCATIONS)}")
     print("=" * 50)
 

@@ -2,8 +2,9 @@ name: 藥局追蹤器
 
 on:
   schedule:
-    # 台灣時間週一、三、五早上 08:00（UTC 00:00）- V2
-    - cron: "0 20 * * 0,2,4"
+    # 每月 1 號台灣時間 08:00（UTC 前一天 00:00）
+    # 2026-07-30：從週三次改成月一次，避免 Places API 免費額度被打爆（詳見 pharmacy_tracker.py 開頭說明）
+    - cron: "0 0 1 * *"
   workflow_dispatch:   # 也可以手動觸發，方便測試
 
 jobs:
