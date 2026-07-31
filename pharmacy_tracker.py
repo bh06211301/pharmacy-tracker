@@ -1,7 +1,7 @@
 """
 pharmacy_tracker.py
 ===================
-藥局異動追蹤系統 — GitHub Actions 版 v5
+藥局異動追蹤系統 — GitHub Actions 版 v6
 覆蓋範圍：台北市、新北市、基隆市、桃園市（47 個行政區，密度加權座標點）
 
 比對邏輯：
