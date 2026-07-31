@@ -40,6 +40,33 @@ v5 變更（座標點模型改版）：
     4000m、只放 1-3 個點意思意思
   - 行政區面積與中心座標為政府公開統計值的近似整理，非逐筆地籍測量
   - 總座標點數從 585 降到 325（依 2026-07 健保藥局分布資料計算）
+
+v6 變更（實測發現漏抓問題後的修正）：
+  - 實測發現：行政區「平均密度」低估了商圈熱點的真實密度，導致部分
+    密集角落單點實際藥局數超過 20 筆被新版 API 悄悄截斷，不少真實
+    存在的藥局被誤判成「消失」
+  - 新增「熱點自動偵測 + 校正」機制，取代單純調低目標筆數（調低目標
+    筆數雖然能降低超量機率，但需要更多座標點、平常就要多付新版API
+    的錢；改成下面這套機制可以維持原本 325 點的低成本，只在真的需要
+    時才多花一點點錢）：
+      1. 每點正常用新版 API（便宜）查詢
+      2. 若剛好回傳 20 筆（頂到上限，疑似超量）→ 當場改用**舊版**
+         Nearby Search API 翻頁補查（最多 3 頁 60 筆），拿到完整清單
+      3. 用這個點「實際觀測到的密度」（不是行政區平均密度）反推一個
+         更小、更精準的校正半徑，寫入 Google Sheet 的「⚙️ 熱點校正
+         清單」分頁**永久保存**
+      4. 下次執行時，這個座標點會直接套用校正後的半徑，正常情況下
+         就不會再超量、也不需要再查舊版 API 了——只有第一次發現、
+         校正的那一次需要多付舊版 API 的錢，之後就回到用便宜的新版
+      5. 每次執行都會照樣檢查所有點（含已校正過的），如果密度持續
+         成長導致校正後的半徑未來又不夠用，會自動再校正一次
+  - 新增店名正面過濾：名稱必須含有「藥局」「藥房」「藥行」其中之一，
+    濾掉 Google 誤標成 pharmacy 類型的其他商家（例如路名、地標）以及
+    藥品批發/製造商（例如「XX藥業股份有限公司」，這種是公司行號不是
+    門市藥局，Google 一樣會因為它賣藥而標成 pharmacy 類型）
+  - 需要在 Google Cloud Console 額外啟用「Places API」（舊版，跟
+    「Places API (New)」是兩個要分別啟用的項目），同一組 PLACES_API_KEY
+    才能同時呼叫兩個版本的 API
 """
 
 import math
@@ -101,6 +128,16 @@ EXCLUDE_CHAINS = [
 
 def is_excluded_chain(name: str) -> bool:
     return any(chain in name for chain in EXCLUDE_CHAINS)
+
+
+# 店名必須含有以下其中之一才算數，濾掉 Google 誤標成 pharmacy 類型的
+# 其他商家（路名/地標等）以及藥品批發、製造商（例如「XX藥業股份有限
+# 公司」，是公司行號不是門市藥局，但 Google 一樣會因為賣藥而標成
+# pharmacy 類型）
+PHARMACY_NAME_INDICATORS = ["藥局", "藥房", "藥行"]
+
+def is_valid_pharmacy_name(name: str) -> bool:
+    return any(ind in name for ind in PHARMACY_NAME_INDICATORS)
 
 
 # ════════════════════════════════════════════
@@ -199,7 +236,13 @@ def _generate_local_grid(center_lat, center_lon, side_km, spacing_km):
     return points
 
 
-def build_locations():
+def build_locations(calibrations: dict = None):
+    """
+    產生座標點清單。calibrations 是 {座標: 校正後半徑}，來自 Google Sheet
+    的「熱點校正清單」——曾經偵測到超量、校正過的點，這裡會直接套用校正後
+    的半徑，取代原本依行政區平均密度算出來的預設值。
+    """
+    calibrations = calibrations or {}
     seen, locs = set(), []
     for city, _dist, clat, clon, area_km2, count in DISTRICTS:
         density = count / area_km2 if area_km2 > 0 else 0.0001
@@ -210,10 +253,9 @@ def build_locations():
             key = f"{lat:.4f},{lon:.4f}"
             if key not in seen:
                 seen.add(key)
-                locs.append((city, key, round(radius_m)))
+                final_radius = calibrations.get(key, round(radius_m))
+                locs.append((city, key, final_radius))
     return locs
-
-LOCATIONS = build_locations()
 
 
 # ════════════════════════════════════════════
@@ -245,6 +287,51 @@ def _worksheets(ss):
 @_sheets_retry
 def _get_all_values(ws):
     return ws.get_all_values()
+
+@_sheets_retry
+def _get_or_create_persistent_sheet(ss, title, headers, rows=1000, cols=10):
+    """跟 get_or_create_sheet 不同：不會清空既有內容，只有完全沒有這個分頁
+    時才建立並寫入表頭。用於需要跨執行持續累積的資料（例如熱點校正清單）"""
+    try:
+        return ss.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = ss.add_worksheet(title=title, rows=rows, cols=cols)
+        ws.append_row(headers)
+        return ws
+
+
+# ════════════════════════════════════════════
+#  熱點校正清單（跨執行持久保存，偵測到超量的座標點會校正半徑存在這裡）
+# ════════════════════════════════════════════
+
+CALIBRATION_SHEET_NAME = "⚙️ 熱點校正清單"
+CALIBRATION_HEADERS = ["座標", "縣市", "校正後半徑", "首次發現日期", "最近校正日期", "校正時實際筆數"]
+
+def load_calibrations(ss) -> dict:
+    """讀取已校正過的座標點清單，回傳 {座標: 校正後半徑}"""
+    ws = _get_or_create_persistent_sheet(ss, CALIBRATION_SHEET_NAME, CALIBRATION_HEADERS)
+    data = _get_all_values(ws)
+    result = {}
+    for row in data[1:]:
+        if len(row) >= 3 and row[0] and row[2]:
+            try:
+                result[row[0]] = float(row[2])
+            except ValueError:
+                continue
+    print(f"⚙️  載入 {len(result)} 個已校正的熱點座標")
+    return result
+
+@_sheets_retry
+def save_calibration(ss, location: str, city: str, new_radius: float, real_count: int):
+    """新增或更新一個座標點的校正紀錄"""
+    ws = _get_or_create_persistent_sheet(ss, CALIBRATION_SHEET_NAME, CALIBRATION_HEADERS)
+    data = _get_all_values(ws)
+    for idx, row in enumerate(data[1:], start=2):  # gspread 1-indexed，第1列是表頭
+        if row and row[0] == location:
+            first_found = row[3] if len(row) > 3 and row[3] else TODAY
+            ws.update(f"A{idx}:F{idx}", [[location, city, round(new_radius), first_found, TODAY, real_count]])
+            return
+    ws.append_row([location, city, round(new_radius), TODAY, TODAY, real_count])
 
 
 # ════════════════════════════════════════════
@@ -404,15 +491,96 @@ def fetch_pharmacies(city, location, radius):
         })
     return results
 
-def fetch_all() -> dict:
-    """抓取所有區域藥局，以 place_id 去重，排除連鎖品牌"""
-    all_data, excluded, total = {}, 0, len(LOCATIONS)
-    for i, (city, location, radius) in enumerate(LOCATIONS, 1):
+
+# ════════════════════════════════════════════
+#  舊版 Places API 補查（只在新版剛好回傳20筆/疑似超量時才呼叫）
+# ════════════════════════════════════════════
+
+def _call_legacy_places_api(params: dict) -> dict:
+    """
+    舊版 Nearby Search，支援分頁最多抓 60 筆。只在新版 API 疑似超量時
+    當備援用，失敗時直接回空清單、不中止整個流程（這只是補查，不是
+    主要資料來源，失敗了就沿用新版的20筆結果，不影響其他座標點）。
+    """
+    try:
+        resp = requests.get(
+            "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
+            params=params, timeout=15,
+        )
+        data = resp.json()
+    except Exception as e:
+        print(f"    ⚠️  舊版API請求失敗：{e}")
+        return {"results": []}
+    status = data.get("status", "")
+    if status not in ("OK", "ZERO_RESULTS"):
+        print(f"    ⚠️  舊版API錯誤：{status}（可能尚未在 Console 啟用「Places API」舊版）")
+        return {"results": []}
+    return data
+
+def fetch_legacy_overflow(city: str, location: str, radius) -> list:
+    """疑似超量點的補查：翻頁抓取，最多3頁(60筆)，拿到完整清單"""
+    results = []
+    params = {
+        "location": location, "radius": radius,
+        "type": "pharmacy", "language": "zh-TW", "key": PLACES_API_KEY,
+    }
+    for _ in range(3):
+        data = _call_legacy_places_api(params)
+        for p in data.get("results", []):
+            loc = p.get("geometry", {}).get("location", {})
+            results.append({
+                "place_id": p.get("place_id", ""),
+                "名稱":     p.get("name", ""),
+                "地址":     p.get("vicinity", ""),
+                "縣市":     city,
+                "緯度":     str(loc.get("lat", "")),
+                "經度":     str(loc.get("lng", "")),
+            })
+        token = data.get("next_page_token")
+        if not token:
+            break
+        time.sleep(2)  # next_page_token 需等待生效
+        params = {"pagetoken": token, "key": PLACES_API_KEY}
+    return results
+
+def _calibrate_radius(current_radius_m: float, real_count: int) -> float:
+    """依這個點實際觀測到的密度（不是行政區平均密度），反推更小、更精準的校正半徑"""
+    if real_count <= TARGET_RESULTS_PER_POINT:
+        return current_radius_m  # 沒有真的超量，維持原半徑
+    real_density = real_count / (math.pi * (current_radius_m / 1000) ** 2)  # 家/km²
+    new_radius_m = math.sqrt(TARGET_RESULTS_PER_POINT / (real_density * math.pi)) * 1000
+    return max(MIN_RADIUS_M, min(current_radius_m, new_radius_m))
+
+
+def fetch_all(ss, locations) -> dict:
+    """
+    抓取所有區域藥局，以 place_id 去重，排除連鎖品牌與非藥局名稱。
+    剛好回傳20筆(疑似超量)的點，會用舊版API補查完整清單並校正半徑，
+    校正結果永久存進 Google Sheet，下次執行直接套用，不用每次都補查。
+    """
+    all_data, excluded, invalid_name, overflow_count, total = {}, 0, 0, 0, len(locations)
+    for i, (city, location, radius) in enumerate(locations, 1):
         if i == 1 or i % 20 == 0:
             print(f"  進度：{i}/{total}")
         try:
-            for p in fetch_pharmacies(city, location, radius):
+            pharmacies = fetch_pharmacies(city, location, radius)
+
+            if len(pharmacies) == 20:
+                overflow_count += 1
+                print(f"    ⚠️  疑似超量：{location}（{city}，半徑{radius}m）→ 用舊版API補查")
+                legacy_pharmacies = fetch_legacy_overflow(city, location, radius)
+                if len(legacy_pharmacies) > len(pharmacies):
+                    real_count = len(legacy_pharmacies)
+                    new_radius = _calibrate_radius(radius, real_count)
+                    save_calibration(ss, location, city, new_radius, real_count)
+                    print(f"       實際{real_count}筆 → 校正半徑為{round(new_radius)}m（已存檔，下次直接套用）")
+                    pharmacies = legacy_pharmacies
+
+            for p in pharmacies:
                 if not p["place_id"]:
+                    continue
+                if not is_valid_pharmacy_name(p["名稱"]):
+                    invalid_name += 1
                     continue
                 if is_excluded_chain(p["名稱"]):
                     excluded += 1
@@ -422,7 +590,10 @@ def fetch_all() -> dict:
         except PlacesApiPermanentError:
             raise  # 立即中止整個搜尋
         time.sleep(0.5)
+    print(f"  已排除非藥局名稱：{invalid_name} 筆（重複計算）")
     print(f"  已排除連鎖品牌：{excluded} 筆（重複計算）")
+    if overflow_count:
+        print(f"  ⚠️  本次共 {overflow_count} 個疑似超量點，已用舊版API補查並校正半徑")
     return all_data
 
 
@@ -624,11 +795,15 @@ def build_message(new_without, new_with, disappeared, renamed, total):
 
 def main():
     print("=" * 50)
-    print(f"  藥局異動追蹤  v5  |  {TODAY}")
-    print(f"  網格座標點數：{len(LOCATIONS)}")
+    print(f"  藥局異動追蹤  v6  |  {TODAY}")
     print("=" * 50)
 
     ss = get_spreadsheet()
+
+    # 0. 載入已校正的熱點半徑，套用到座標點產生邏輯
+    calibrations = load_calibrations(ss)
+    locations = build_locations(calibrations)
+    print(f"  網格座標點數：{len(locations)}")
 
     # 1. 載入上次快照
     previous = load_previous_snapshot(ss)
@@ -637,9 +812,9 @@ def main():
     baseline_addrs = load_baseline_addresses(ss)
 
     # 3. 抓取今日 Google Places 資料
-    print(f"\n📡 抓取 Google Places（{len(LOCATIONS)} 個座標點）...")
+    print(f"\n📡 抓取 Google Places（{len(locations)} 個座標點）...")
     try:
-        today = fetch_all()
+        today = fetch_all(ss, locations)
     except PlacesApiPermanentError as e:
         msg = (f"⚠️ 藥局追蹤緊急中止\n📅 {TODAY}\n\n"
                f"{e}\n\n請至 GitHub Secrets 更新 PLACES_API_KEY")
